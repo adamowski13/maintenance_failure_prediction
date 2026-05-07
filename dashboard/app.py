@@ -7,22 +7,28 @@ Lancement :
     streamlit run dashboard/app.py
 """
 
-import sys, time
+import os, sys, time
 from pathlib import Path
 from datetime import datetime, timedelta
+
+import yaml
+import joblib
+import warnings
+import requests
+import numpy as np
+import pandas as pd
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import streamlit as st
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import joblib
-import warnings
-import numpy as np
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import streamlit as st
+
 
 warnings.filterwarnings("ignore")
 
@@ -52,6 +58,89 @@ MODEL_LABELS = {
     "xgboost":             "XGBoost",
     "mlp":                 "MLP Deep Learning",
 }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION API — Architecture Front / API / Modèle (cf. sujet p.15)
+# ──────────────────────────────────────────────────────────────────────────────
+# Le dashboard fonctionne en deux modes contrôlés par variables d'environnement :
+#   - USE_API=false (défaut) : prédiction locale via joblib.load (mode dev rapide)
+#   - USE_API=true           : prédiction via POST /predict de l'API REST
+# En Docker, API_URL=http://api:8000 (nom de service du compose).
+# En local, API_URL=http://localhost:8000.
+USE_API     = os.getenv("USE_API", "false").lower() == "true"
+API_URL     = os.getenv("API_URL", "http://localhost:8000")
+API_TIMEOUT = 5  # secondes — court pour ne pas bloquer le dashboard
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def api_is_alive() -> bool:
+    """
+    Health check de l'API. Cache 10s pour éviter de spammer /health
+    à chaque rerender Streamlit. Renvoie True si l'API répond ET a un modèle chargé.
+    """
+    try:
+        r = requests.get(f"{API_URL}/health", timeout=2)
+        return r.status_code == 200 and r.json().get("model_loaded", False)
+    except Exception:
+        return False
+
+
+def predict_via_api(vals: dict, model_name: str | None = None) -> dict | None:
+    """
+    Appelle POST /predict de l'API REST.
+
+    Args:
+        vals       : dict avec les capteurs bruts (mêmes clés que SensorInput côté API)
+        model_name : nom du modèle ('xgboost', 'random_forest', etc.) ou None = défaut API
+
+    Returns:
+        dict JSON complet de l'API (probability_failure, risk_level, health_score, ...)
+        ou None si l'API est injoignable / erreur.
+    """
+    payload = {
+        "vibration_rms":           float(vals["vibration_rms"]),
+        "temperature_motor":       float(vals["temperature_motor"]),
+        "current_phase_avg":       float(vals["current_phase_avg"]),
+        "pressure_level":          float(vals["pressure_level"]),
+        "rpm":                     float(vals["rpm"]),
+        "hours_since_maintenance": float(vals["hours_since_maintenance"]),
+        "ambient_temp":            float(vals.get("ambient_temp", 22.0)),
+        "operating_mode":          str(vals["operating_mode"]),
+    }
+    if model_name:
+        payload["model_name"] = model_name
+
+    try:
+        r = requests.post(f"{API_URL}/predict", json=payload, timeout=API_TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException as e:
+        st.warning(f"⚠️ API injoignable ({type(e).__name__}) — fallback modèle local.")
+        return None
+
+
+def predict_proba(vals: dict, models: dict, model_key: str) -> float:
+    """
+    Wrapper d'inférence — point d'entrée unique du dashboard.
+
+    Routage :
+      - USE_API=true ET API up   → POST /predict
+      - USE_API=true ET API down → fallback silencieux sur modèle local
+      - USE_API=false            → modèle local directement (comportement initial)
+
+    Garantit que l'UI ne crash JAMAIS si l'API tombe : un dashboard production-ready
+    doit dégrader gracieusement. Renvoie toujours une probabilité de panne ∈ [0, 1].
+    """
+    if USE_API:
+        result = predict_via_api(vals, model_name=model_key)
+        if result is not None:
+            return float(result["probability_failure"])
+        # fallback silencieux
+
+    # Mode local — comportement historique
+    X = build_X(vals)
+    return float(models[model_key].predict_proba(X)[0, 1])
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # THÈME CSS — DARK INDUSTRIAL
@@ -183,6 +272,86 @@ def load_metrics():
     return pd.read_csv(p)
 
 
+@st.cache_resource(show_spinner=False)
+def load_auth_config():
+    """Charge la configuration d'authentification depuis config/auth.yaml"""
+    config_path = ROOT / "config" / "auth.yaml"
+    if not config_path.exists():
+        st.error(f"❌ Fichier de configuration manquant : {config_path}")
+        st.stop()
+    
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        return config
+    except Exception as e:
+        st.error(f"❌ Erreur chargement config : {e}")
+        st.stop()
+
+
+AUTH_CONFIG = load_auth_config()
+ROLES = AUTH_CONFIG.get("roles", {})
+AUTH_USERS = AUTH_CONFIG.get("users", {})
+ROLE_LABELS = {role_key: role_info.get("label", role_key) for role_key, role_info in ROLES.items()}
+ROLE_DATA_SCIENCE = "data_science"
+ROLE_ENGINEER = "engineer"
+
+
+def initialize_auth_state():
+    st.session_state.setdefault("authenticated", False)
+    st.session_state.setdefault("username", "")
+    st.session_state.setdefault("role", ROLE_ENGINEER)
+
+
+def authenticate(username: str, password: str) -> tuple[bool, str | None]:
+    user = AUTH_USERS.get(username.strip().lower())
+    if not user:
+        return False, None
+    
+    password_hash = user.get("password_hash")
+    if not password_hash:
+        return False, None
+    
+    try:
+        ph = PasswordHasher()
+        ph.verify(password_hash, password)
+        return True, user.get("role", ROLE_ENGINEER)
+    except VerifyMismatchError:
+        return False, None
+    except Exception:
+        return False, None
+
+
+def show_login_page():
+    st.markdown("<h1>🔐 Authentification Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown(
+        '<p style="color:#8b949e">Connectez-vous pour accéder au tableau de bord PredictMaint Pro.</p>',
+        unsafe_allow_html=True,
+    )
+    with st.form("login_form"):
+        username = st.text_input("Nom d'utilisateur", value=st.session_state.get("username", ""))
+        password = st.text_input("Mot de passe", type="password")
+        submit = st.form_submit_button("Se connecter")
+        if submit:
+            ok, role = authenticate(username, password)
+            if ok:
+                st.session_state.authenticated = True
+                st.session_state.username = username.strip().lower()
+                st.session_state.role = role
+                st.rerun()
+            else:
+                st.error("Identifiant ou mot de passe incorrect.")
+
+    st.markdown("---")
+    st.markdown("**Profils disponibles :**")
+    for username, user_info in AUTH_USERS.items():
+        role_key = user_info.get("role", ROLE_ENGINEER)
+        role_info = ROLES.get(role_key, {})
+        description = role_info.get("description", "")
+        st.markdown(f"- `{username}` — {description}")
+    st.stop()
+
+
 def health_score(vals):
     def norm(v, lo, hi): return max(0., min(1., (v - lo) / (hi - lo + 1e-9)))
     v = norm(vals.get("vibration_rms",    2.5), 0.5,  6.0)
@@ -243,6 +412,10 @@ def kpi(label, value, delta_html="", accent="#58a6ff"):
     )
 
 
+initialize_auth_state()
+if not st.session_state.authenticated:
+    show_login_page()
+
 # ──────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ──────────────────────────────────────────────────────────────────────────────
@@ -258,18 +431,47 @@ with st.sidebar:
     )
     st.divider()
 
+    st.markdown(
+        f'''<div style="padding:12px;margin-bottom:12px;border:1px solid #30363d;border-radius:10px;">
+          <b>Utilisateur</b> : {st.session_state.username}<br>
+          <b>Profil</b> : {ROLE_LABELS.get(st.session_state.role, "—")}
+        </div>''',
+        unsafe_allow_html=True,
+    )
+    if st.button("🔓 Se déconnecter"):
+        st.session_state.authenticated = False
+        st.session_state.username = ""
+        st.session_state.role = ROLE_ENGINEER
+        st.rerun()
+
+    common_pages = [
+        "🏠  Vue d'ensemble",
+        "🚨  Alertes en temps réel",
+        "⚙️  Simulateur Machine",
+        "📊  Analyse EDA",
+    ]
+    data_pages = common_pages + [
+        "🤖  Modèles & Performances",
+        "🔍  Explicabilité IA",
+        "💼  Use Cases Métier",
+    ]
+    page_options = data_pages if st.session_state.role == ROLE_DATA_SCIENCE else common_pages
+
     page = st.radio(
         "Navigation",
-        options=[
-            "🏠  Vue d'ensemble",
-            "🚨  Alertes en temps réel",
-            "🤖  Modèles & Performances",
-            "⚙️  Simulateur Machine",
-            "📊  Analyse EDA",
-            "🔍  Explicabilité IA",
-            "💼  Use Cases Métier",
-        ],
+        options=page_options,
         label_visibility="collapsed",
+    )
+    st.divider()
+
+    if st.session_state.role == ROLE_ENGINEER:
+        st.markdown(
+            '<div class="alert-medium">Accès ingénieur : pages modèles et explicabilité masquées.</div>',
+            unsafe_allow_html=True,
+        )
+    st.markdown(
+        f'<div style="color:#484f58;font-size:.72rem;text-align:center">{datetime.now().strftime("%d/%m/%Y %H:%M")}</div>',
+        unsafe_allow_html=True,
     )
     st.divider()
 
@@ -299,6 +501,34 @@ with st.sidebar:
             f'<span style="color:#8b949e;font-size:.78rem">{label}</span></div>',
             unsafe_allow_html=True,
         )
+
+    # ── Indicateur du mode d'inférence (Front / API / Modèle) ────────────────
+    if USE_API:
+        api_ok = api_is_alive()
+        mode_color = "#3fb950" if api_ok else "#d29922"
+        mode_icon  = "🟢" if api_ok else "🟡"
+        mode_label = (
+            f"<b>API REST</b> · {mode_icon} active<br>"
+            f"<span style='color:#8b949e;font-size:.7rem'>{API_URL}</span>"
+            if api_ok else
+            f"<b>API REST</b> · {mode_icon} indisponible<br>"
+            f"<span style='color:#8b949e;font-size:.7rem'>fallback local actif</span>"
+        )
+    else:
+        mode_color = "#58a6ff"
+        mode_label = (
+            "<b>Mode local</b> · 🔵 modèles en mémoire<br>"
+            "<span style='color:#8b949e;font-size:.7rem'>USE_API=true pour activer l'API</span>"
+        )
+
+    st.markdown(
+        f'<div style="margin-top:14px;padding:10px 12px;'
+        f'border-left:3px solid {mode_color};background:rgba(255,255,255,0.02);'
+        f'border-radius:4px;font-size:.78rem;color:#c9d1d9;line-height:1.4">'
+        f'{mode_label}</div>',
+        unsafe_allow_html=True,
+    )
+
     st.divider()
     st.markdown(
         f'<div style="color:#484f58;font-size:.72rem;text-align:center">'
@@ -718,16 +948,23 @@ elif page == "⚙️  Simulateur Machine":
         pressure_level = st.slider("Pression (bar)", 2.0, 12.0, float(sc_vals["pressure_level"]) if sc_vals else 6.0, step=0.1)
         operating_mode = st.selectbox("Mode opératoire", ["normal","high_load","peak"],
                                        index=["normal","high_load","peak"].index(sc_vals["operating_mode"]) if sc_vals else 0)
-        selected_model = st.selectbox("Modèle ML", list(models.keys()), format_func=lambda k: MODEL_LABELS.get(k,k))
+        if st.session_state.role == ROLE_ENGINEER:
+            selected_model = list(models.keys())[0]
+            st.markdown(
+                f'''<div style="margin-top:14px; padding:10px; border:1px solid #30363d; border-radius:10px; background:rgba(255,255,255,0.03);">
+                <b>Modèle par défaut :</b> {MODEL_LABELS.get(selected_model, selected_model)}</div>''',
+                unsafe_allow_html=True,
+            )
+        else:
+            selected_model = st.selectbox("Modèle ML", list(models.keys()), format_func=lambda k: MODEL_LABELS.get(k, k))
 
     input_vals = dict(vibration_rms=vibration_rms, temperature_motor=temperature_motor,
                       current_phase_avg=current_phase_avg, pressure_level=pressure_level,
                       rpm=rpm, hours_since_maintenance=hours_since_maintenance,
                       ambient_temp=ambient_temp, operating_mode=operating_mode)
-    X_pred = build_X(input_vals)
 
     try:
-        proba = float(models[selected_model].predict_proba(X_pred)[0, 1])
+        proba = predict_proba(input_vals, models, selected_model)
     except Exception as e:
         st.error(f"Erreur prédiction : {e}")
         st.stop()
@@ -1063,12 +1300,11 @@ python main.py --shap
             if models:
                 sel_loc = st.selectbox("Modèle", list(models.keys()),
                                         format_func=lambda k: MODEL_LABELS.get(k,k), key="sel_loc")
-                X_loc = build_X({f: float(row_d.get(f, 0)) for f in FEATURES_NUM} | {
-                    "ambient_temp": float(row_d.get("ambient_temp", 22.)),
-                    "operating_mode": str(row_d.get("operating_mode","normal")),
-                })
+                loc_vals = {f: float(row_d.get(f, 0)) for f in FEATURES_NUM}
+                loc_vals["ambient_temp"]   = float(row_d.get("ambient_temp", 22.))
+                loc_vals["operating_mode"] = str(row_d.get("operating_mode", "normal"))
                 try:
-                    p_loc = float(models[sel_loc].predict_proba(X_loc)[0,1])
+                    p_loc = predict_proba(loc_vals, models, sel_loc)
                     rl_loc, rc_loc, rb_loc = risk_label(p_loc)
                     st.metric("Probabilité prédite", f"{p_loc*100:.1f}%")
                     st.markdown(f'<span class="badge {rb_loc}">{rl_loc}</span>', unsafe_allow_html=True)
